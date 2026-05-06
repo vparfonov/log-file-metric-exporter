@@ -1,125 +1,222 @@
 # AGENTS.md
 
-This file provides guidance to automated agents when working with code in this repository.
+This file provides guidance to automated agents (AI or otherwise) when working with code in this repository.
 
 ## Project Overview
 
-The log-file-metric-exporter is a Prometheus exporter that monitors Kubernetes pod log files and exports the `log_logged_bytes_total` metric. 
-This allows comparison of bytes actually logged versus what log collectors are able to collect during runtime.
+The log-file-metric-exporter is a Prometheus exporter that monitors Kubernetes pod log files and exports the `log_logged_bytes_total` counter metric. This allows comparison of bytes actually logged versus what log collectors (e.g., Fluentd, Vector) are able to collect during runtime.
 
-## Architecture
+## Core Principles
+
+1. **Security First**: Default to HTTPS with TLS; authentication should be the norm, not optional
+2. **Kubernetes Native**: Assume pod log structure at `/var/log/pods/<namespace>_<podname>_<uuid>/<container>/`
+3. **Simplicity**: Prefer sequential metric updates and straightforward logic over extreme performance
+4. **Testability**: All components should have unit tests; benchmarks for performance-critical paths
+
+## Architecture Summary
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design decisions, tradeoffs, and implementation details.
 
 ### Core Components
 
 1. **Main Entry Point** (`cmd/main.go`)
-   - Initializes the log watcher on `/var/log/pods` (configurable via `-dir` flag)
-   - Sets up HTTPS server on port 2112 (configurable via `-http` flag) for Prometheus metrics endpoint
-   - Configures TLS with customizable minimum version and cipher suites
-   - Supports OpenSSL cipher suite names that are mapped to IANA names
+   - Parses command-line flags (directory, port, TLS, auth token)
+   - Sets up HTTPS with TLS certificates and configurable cipher suites
+   - Mounts Prometheus metrics endpoint with optional bearer token auth
+   - Spawns LogWatcher in a background goroutine
 
 2. **Log Watcher** (`pkg/logwatch/watcher.go`)
-   - Tracks log file size changes using a custom symlink-aware file watching mechanism
-   - Parses Kubernetes log file paths with regex: `/namespace_podname_poduuid/containername/*.log`
-   - Maintains a map of `LogLabels` to last known file sizes to detect growth or truncation
-   - Uses mutex-protected concurrent access for metrics updates
-   - Runs 5 goroutines concurrently to process file system events
+   - Watches directory (default: `/var/log/pods`) for file size changes
+   - Parses Kubernetes log paths with regex to extract labels: namespace, pod name, pod UUID, container name
+   - Maintains last-known file sizes; detects growth, truncation, and deletion
+   - Updates `log_logged_bytes_total` counter on size changes
+   - Runs 5 concurrent goroutines to process events
 
 3. **Symlink Notifier** (`pkg/symnotify/symnotify.go`)
-   - Wraps `fsnotify.Watcher` to handle symlinks properly (critical for Kubernetes log files)
-   - Automatically adds watches for symlink targets, directories, and their contents
-   - Handles symlink re-targeting on Chmod/Rename events
-   - Recursively watches directories for new symlinks and subdirectories
+   - Wraps `fsnotify.Watcher` to handle Kubernetes symlinked log files
+   - Auto-adds watches for symlink targets and directories
+   - Recursively watches subdirectories; re-targets on symlink changes
+   - Critical for correctness (without this, many events would be missed)
 
-### Key Architectural Patterns
+4. **Kubernetes Auth** (`pkg/auth/`)
+   - `auth.go`: `KubeAuthenticator` validates bearer tokens via Kubernetes TokenReview API and checks authorization via SubjectAccessReview
+   - `middleware.go`: `AuthMiddleware` wraps the metrics handler — extracts bearer token from `Authorization` header, authenticates, then authorizes `GET` on the request path
+   - Enabled when `-secureMetrics` flag is set to `true`
 
-- **Metric Update Logic**: When a file grows, add the difference; when truncated, add the new size (handles log rotation)
-- **Concurrent Event Processing**: Uses a pool of 5 goroutines with `sync.WaitGroup` to process events in parallel
-- **Label Extraction**: Log file paths follow Kubernetes convention and are parsed to extract namespace, pod name, pod UUID, and container name
-- **Prometheus Labels**: `namespace`, `podname`, `poduuid`, `containername`
+## Problems This Project Solves
 
-## Development Commands
+### 1. Tracking Actual Log Volume
+**Problem**: In Kubernetes, there's no built-in way to see how many bytes each pod is actually writing to its logs. Log collectors (Fluentd, Vector) may fall behind, and without a reference metric you can't tell how much data is being lost.
 
-### Building and Testing
+**How**: The exporter watches log files at `/var/log/pods` and maintains a `log_logged_bytes_total` counter per namespace/pod/container. It tracks file size changes — when a file grows, the delta is added to the counter. This gives Prometheus a ground-truth metric to compare against collector ingestion rates.
 
+### 2. Handling Kubernetes Symlinked Log Files
+**Problem**: Kubernetes stores pod logs as symlinks that point to container runtime log locations. When logs rotate, the symlink target changes. Standard `fsnotify` doesn't track symlink re-targeting — it reports the event on the symlink path but won't automatically watch the new target.
+
+**How**: `SymNotifier` (`pkg/symnotify`) wraps `fsnotify` and handles this transparently. On Chmod/Rename events, it detects symlink re-targeting by removing and re-adding the watch. On Create events, it recursively adds watches for new symlinks and subdirectories.
+
+### 3. Handling Log Rotation
+**Problem**: Container logs rotate — files get truncated and start fresh. A naive watcher that assumes files only grow would either miss data or double-count bytes after rotation.
+
+**How**: `Watcher.Update()` in `pkg/logwatch` compares the current file size to the last known size. If the file grew (`size > lastSize`), it adds the delta. If the file was truncated (`size < lastSize`), it adds just the new size — correctly counting bytes written after rotation without double-counting.
+
+### 4. Controlled Concurrency Under Load
+**Problem**: A busy cluster can generate thousands of file system events per second. Processing events one at a time is too slow, but spawning a goroutine per event leads to unbounded resource usage.
+
+**How**: `Watcher.Watch()` in `pkg/logwatch` uses a fixed pool of 5 goroutines per iteration. Each goroutine blocks on the next event, processes it, then the pool resets. This drains the event queue faster than sequential processing while keeping resource usage predictable.
+
+### 5. Flexible Log Path Discovery
+**Problem**: The watch directory and log path structure may vary across environments. Hard-coding paths would limit portability.
+
+**How**: The watch directory is configurable via the `-dir` flag (default: `/var/log/pods`). Log paths are parsed with a regex that extracts namespace, pod name, pod UUID, and container name from the Kubernetes path convention. This tolerates minor path variations without code changes.
+
+## Development Workflow
+
+### Building
 ```bash
-# Format code
-make fmt
-
-# Build binary (outputs to bin/log-file-metric-exporter)
-make build
-
-# Run tests with coverage (outputs to ./tmp/coverage/)
-make test
-
-# Run linter
-make lint
-
-# Clean artifacts
-make clean
+make build     # Binary to bin/log-file-metric-exporter
+make fmt       # Format Go code
+make lint      # Run linter
+make clean     # Remove artifacts
 ```
 
-### Container Operations
+### Testing
+```bash
+make test              # Run all tests + coverage report
+go test -v ./pkg/...   # Verbose test output
+go test -bench=. ./pkg/symnotify  # Benchmarks
+```
+
+### Containers
+```bash
+make image             # Build container image
+make image-src         # Build test/debug container
+make test-container-local  # Run tests in container
+```
+
+## Code Style and Conventions
+
+### Go Conventions
+- Follow standard Go style (enforced by `gofmt`)
+- Run `make fmt` before committing
+- No multi-line comments; one-liner comments only
+- Comment the *why*, not the *what* (code should be clear)
+
+### Naming
+- Metrics: lowercase with underscores (e.g., `log_logged_bytes_total`)
+- Functions/types: PascalCase (Go standard)
+- Constants: Go convention (exported `PascalCase`, unexported `camelCase`)
+- Package names: short, lowercase, no underscores
+
+### Metrics and Labels
+- Metric: `log_logged_bytes_total` (counter, in bytes)
+- Labels: `namespace`, `podname`, `poduuid`, `containername` (all lowercase)
+- No high-cardinality labels (avoid unique pod IDs); use pod UUID instead
+
+### Import Organization
+```go
+import (
+    "fmt"
+    "os"
+    // stdlib
+    
+    "github.com/prometheus/client_golang/prometheus"
+    // vendor
+    
+    "github.com/log-file-metric-exporter/pkg/logwatch"
+    // local
+)
+```
+
+## Key Code Paths
+
+### When Starting Work
+1. Read this file first
+2. Skim [ARCHITECTURE.md](ARCHITECTURE.md) for the relevant component
+3. Look at the component's `_test.go` file to understand behavior
+
+### Path Parsing
+See `pkg/logwatch/watcher.go`: `LogLabels.Parse(path)`
+- Regex (package-level `logFile` var): `/([a-z0-9-]+)_([a-z0-9-]+)_([a-f0-9-]+)/([a-z0-9-]+)/.*\.log`
+- Groups: Namespace, Name (pod name), UUID, Container
+- Case: all labels must be lowercase
+
+### Metric Updates
+See `pkg/logwatch/watcher.go`: `Watcher.Update(path)`
+- **File grows**: `counter.Add(size - lastSize)`
+- **File truncates**: `counter.Add(size)` (size < lastSize means rotation)
+- **File deleted / disappears**: `Watcher.Forget(path)` — deletes metric labels and size tracking
+
+### Event Processing
+See `pkg/logwatch/watcher.go`: `Watcher.Watch()` and `Watcher.processNextEvent()`
+- Loop: spawn 5 goroutines, each calls `symnotify.Watcher.Event()` (blocking), wait for all, repeat
+- Each `Event()` call returns one fsnotify event (Name, Op)
+- On `Remove`: call `Forget()`; on all others: call `Update()`
+- Don't change this concurrency pattern without benchmarking
+
+### Symlink Handling
+See `pkg/symnotify/symnotify.go`: `Watcher.Add(name)` and `Watcher.Event()`
+- `Add()`: watches the path; if it's a directory, scans for subdirectories and symlinks and watches them recursively
+- `Event()`: on Create events, adds watches for new symlinks/directories; on Chmod/Rename, removes and re-adds watch (symlink target may have changed); on Remove, removes the watch
+- Directory watches are recursive; new subdirectories auto-watched
+
+## Testing Guidelines
+
+### Unit Test Structure
+```go
+func TestMyFunction(t *testing.T) {
+    // Setup
+    input := setupTestData()
+    
+    // Execute
+    result := MyFunction(input)
+    
+    // Assert
+    if result != expected {
+        t.Errorf("got %v, want %v", result, expected)
+    }
+}
+```
+
+### Required Test Coverage
+- **Happy path**: Normal operation (file grows, log rotation, deletion)
+- **Edge cases**: Empty files, rapid size changes, symlink re-targeting
+- **Error cases**: Permission errors, missing files, invalid paths
+
+### Benchmarks
+`pkg/symnotify/symnotify_benchmark_test.go` has `BenchmarkStress` for file system event throughput.
+Run with: `go test -bench=. ./pkg/symnotify`
+
+## Common Commands
 
 ```bash
-# Build container image
-make image
+# Build and test
+make build test lint
 
-# Build source container image for testing
-make image-src
+# Run a single test
+go test -run TestParseLogLabels ./pkg/logwatch
 
-# Test inside container locally
+# Debug with verbose output
+go test -v -run TestParseLogLabels ./pkg/logwatch
+
+# Check coverage for a package
+go test -cover ./pkg/logwatch
+
+# Run container tests
 make test-container-local
-
-# Push source image to registry
-make push-image-src
 ```
 
-### Running Tests
+## When to Update This File
 
-```bash
-# Run all tests
-go test ./pkg/... ./cmd
+- Add guidance for common mistakes you discover
+- Document new conventions or patterns
+- Remove guidance that becomes obsolete
+- Link to new architecture documentation
 
-# Run specific package tests
-go test ./pkg/logwatch
-go test ./pkg/symnotify
+## References
 
-# Run with verbose output
-go test -v ./pkg/...
-
-# Run benchmarks
-go test -bench=. ./pkg/symnotify
-```
-
-## Important Implementation Details
-
-### Log Path Regex
-The regex pattern `/([a-z0-9-]+)_([a-z0-9-]+)_([a-f0-9-]+)/([a-z0-9-]+)/.*\.log` expects:
-- Group 1: namespace (lowercase alphanumeric and hyphens)
-- Group 2: pod name (lowercase alphanumeric and hyphens)
-- Group 3: pod UUID (hex and hyphens)
-- Group 4: container name (lowercase alphanumeric and hyphens)
-
-### Metric Behavior
-- File grows: `counter.Add(newSize - lastSize)`
-- File truncated: `counter.Add(newSize)` (starts counting from truncation point)
-- File removed: Delete metric labels and forget size tracking
-
-### TLS Configuration
-- Minimum TLS version: Use `-tlsMinVersion` flag (e.g., "VersionTLS12", "VersionTLS13")
-- Cipher suites: Use `-cipherSuites` flag with comma-separated OpenSSL names
-- The code maps OpenSSL cipher names to IANA names (see `openSSLToIANACiphersMap`)
-
-### Concurrency Model
-The `Watch()` method runs an infinite loop where each iteration:
-1. Creates a `WaitGroup` with count 5
-2. Spawns 5 goroutines that each call `watcher.Event()` (blocking)
-3. Waits for all 5 to complete before starting the next batch
-This ensures continuous event processing with controlled parallelism.
-
-## Testing Notes
-
-- Test files use the `_test.go` suffix
-- Coverage reports are generated in HTML format at `./tmp/coverage/test-unit-coverage.html`
-- The test suite includes benchmarks for `symnotify` performance
-- Tests verify log label parsing, file watching behavior, and metric updates
+- **Architecture**: [ARCHITECTURE.md](ARCHITECTURE.md)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- **README**: [README.md](README.md)
+- **Prometheus Docs**: https://prometheus.io/docs/instrumenting/exposition_formats/
+- **fsnotify**: https://github.com/fsnotify/fsnotify
