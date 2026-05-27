@@ -6,7 +6,7 @@ ENV CGO_ENABLED=1
 COPY . /opt/app-root/src
 WORKDIR /opt/app-root/src
 
-RUN make build LDFLAGS="-tags strictfipsruntime"
+RUN make build LDFLAGS="-tags strictfipsruntime -ldflags '-s -w'"
 
 FROM registry.redhat.io/ubi9/ubi-minimal:9.7
 
